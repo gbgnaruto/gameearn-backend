@@ -36,9 +36,9 @@ io.on('connection', (socket) => {
                 playlist: [],
                 users: [],
                 disconnectTimer: null,
-                // NEW: Memory tracking for late joiners and refreshes
                 currentVideo: null, 
                 currentTime: 0,
+                currentRate: 1, // NEW: Track playback speed
                 isPlaying: false
             };
         }
@@ -46,10 +46,7 @@ io.on('connection', (socket) => {
         socket.join(roomId);
         const room = rooms[roomId];
 
-        if (room.hostUserId === userId && room.disconnectTimer) {
-            clearTimeout(room.disconnectTimer);
-            room.disconnectTimer = null;
-        }
+        if (room.hostUserId === userId && room.disconnectTimer) { clearTimeout(room.disconnectTimer); room.disconnectTimer = null; }
 
         const isHost = room.hostUserId === userId;
         const newUser = { socketId: socket.id, userId, username: username || "Guest", isHost };
@@ -57,24 +54,22 @@ io.on('connection', (socket) => {
         room.users = room.users.filter(u => u.userId !== userId);
         room.users.push(newUser);
         
-        // NEW: Send current video state to the person who just joined
         socket.emit('room_data', { 
-            isHost, 
-            playlist: room.playlist, 
-            roomName: room.name,
-            currentVideo: room.currentVideo,
-            currentTime: room.currentTime,
-            isPlaying: room.isPlaying
+            isHost, playlist: room.playlist, roomName: room.name,
+            currentVideo: room.currentVideo, currentTime: room.currentTime,
+            currentRate: room.currentRate, isPlaying: room.isPlaying
         });
         
         io.to(roomId).emit('update_users', room.users);
         io.to(roomId).emit('chat_message', { system: true, text: `${newUser.username} joined.` });
         
-        broadcastPublicRooms();
-        callback({ success: true });
+        broadcastPublicRooms(); callback({ success: true });
     });
 
     socket.on('chat_message', (data) => io.to(data.roomId).emit('chat_message', { username: data.username, text: data.text }));
+    
+    // NEW: Floating Emojis
+    socket.on('emoji_reaction', (data) => io.to(data.roomId).emit('emoji_reaction', data.emoji));
 
     socket.on('transfer_host', (data) => {
         const room = rooms[data.roomId];
@@ -90,23 +85,24 @@ io.on('connection', (socket) => {
         }
     });
 
-    // NEW: Update server memory when Host changes video or plays/pauses
-    socket.on('change_video', (data) => {
-        if(rooms[data.roomId]) { rooms[data.roomId].currentVideo = data; rooms[data.roomId].currentTime = 0; }
-        socket.to(data.roomId).emit('load_video', data);
-    });
+    // MEDIA SYNC
+    socket.on('change_video', (data) => { if(rooms[data.roomId]) { rooms[data.roomId].currentVideo = data; rooms[data.roomId].currentTime = 0; } socket.to(data.roomId).emit('load_video', data); });
+    socket.on('play_video', (data) => { if(rooms[data.roomId]) { rooms[data.roomId].currentTime = data.time; rooms[data.roomId].isPlaying = true; } socket.to(data.roomId).emit('sync_play', data.time); });
+    socket.on('pause_video', (data) => { if(rooms[data.roomId]) { rooms[data.roomId].currentTime = data.time; rooms[data.roomId].isPlaying = false; } socket.to(data.roomId).emit('sync_pause', data.time); });
     
-    socket.on('play_video', (data) => {
-        if(rooms[data.roomId]) { rooms[data.roomId].currentTime = data.time; rooms[data.roomId].isPlaying = true; }
-        socket.to(data.roomId).emit('sync_play', data.time);
-    });
-    
-    socket.on('pause_video', (data) => {
-        if(rooms[data.roomId]) { rooms[data.roomId].currentTime = data.time; rooms[data.roomId].isPlaying = false; }
-        socket.to(data.roomId).emit('sync_pause', data.time);
+    // NEW: Sync Playback Speed
+    socket.on('change_rate', (data) => {
+        if(rooms[data.roomId]) rooms[data.roomId].currentRate = data.rate;
+        socket.to(data.roomId).emit('sync_rate', data.rate);
     });
 
     socket.on('update_playlist', (data) => { if (rooms[data.roomId]) { rooms[data.roomId].playlist = data.playlist; socket.to(data.roomId).emit('sync_playlist', data.playlist); }});
+
+    // NEW: WEBRTC VOICE CHAT SIGNALING
+    socket.on('voice_join', (data) => socket.to(data.roomId).emit('voice_user_joined', { socketId: socket.id }));
+    socket.on('webrtc_offer', (data) => io.to(data.target).emit('webrtc_offer', { sender: socket.id, sdp: data.sdp }));
+    socket.on('webrtc_answer', (data) => io.to(data.target).emit('webrtc_answer', { sender: socket.id, sdp: data.sdp }));
+    socket.on('webrtc_ice', (data) => io.to(data.target).emit('webrtc_ice', { sender: socket.id, candidate: data.candidate }));
 
     socket.on('disconnect', () => {
         for (const roomId in rooms) {
@@ -116,18 +112,16 @@ io.on('connection', (socket) => {
                 const user = room.users[userIndex];
                 room.users.splice(userIndex, 1);
                 io.to(roomId).emit('update_users', room.users);
-                io.to(roomId).emit('chat_message', { system: true, text: `${user.username} left.` });
-
-                if (room.users.length === 0) {
-                    delete rooms[roomId]; broadcastPublicRooms();
-                } else if (user.isHost) {
+                io.to(roomId).emit('voice_user_left', { socketId: socket.id }); // Tell others to drop the voice call
+                
+                if (room.users.length === 0) { delete rooms[roomId]; broadcastPublicRooms(); } 
+                else if (user.isHost) {
                     room.disconnectTimer = setTimeout(() => {
                         if (rooms[roomId] && rooms[roomId].users.length > 0) {
                             const newHost = rooms[roomId].users[0];
                             rooms[roomId].hostUserId = newHost.userId; newHost.isHost = true;
                             io.to(roomId).emit('update_users', rooms[roomId].users);
                             io.to(newHost.socketId).emit('you_are_host');
-                            io.to(roomId).emit('chat_message', { system: true, text: `👑 Host timed out. ${newHost.username} is Host.` });
                         }
                     }, 60000); 
                 }
@@ -137,5 +131,5 @@ io.on('connection', (socket) => {
     });
 });
 
-app.get('/', (req, res) => res.send("SyncTube Master Server v3"));
+app.get('/', (req, res) => res.send("SyncTube Master Server v4 (WebRTC)"));
 server.listen(process.env.PORT || 3000, () => console.log(`Server running`));
