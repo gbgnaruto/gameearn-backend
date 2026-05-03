@@ -61,7 +61,7 @@ io.on('connection', (socket) => {
                 if (u.socketId === socket.id) u.isHost = false;
                 if (u.socketId === data.targetId) { u.isHost = true; u.isCoHost = false; }
             });
-            io.to(data.targetId).emit('you_are_host');
+            // Single Source of Truth Update
             io.to(data.roomId).emit('update_users', room.users);
             io.to(data.roomId).emit('chat_message', { system: true, text: `👑 The Host Crown was transferred!` });
         }
@@ -73,7 +73,6 @@ io.on('connection', (socket) => {
             const targetUser = room.users.find(u => u.socketId === data.targetId);
             if(targetUser) {
                 targetUser.isCoHost = !targetUser.isCoHost;
-                io.to(data.targetId).emit('you_are_cohost', targetUser.isCoHost);
                 io.to(data.roomId).emit('update_users', room.users);
                 const msg = targetUser.isCoHost ? `⭐ ${targetUser.username} was granted Co-Host power!` : `🔒 ${targetUser.username}'s Co-Host power was revoked.`;
                 io.to(data.roomId).emit('chat_message', { system: true, text: msg });
@@ -119,7 +118,10 @@ io.on('connection', (socket) => {
 
     socket.on('broadcast_sync_data', (data) => {
         const room = rooms[data.roomId];
-        if (room && room.host === socket.id) socket.to(data.roomId).emit('host_send_sync', { time: data.time, state: data.state });
+        // Ensure only the absolute host broadcasts the heartbeat to prevent conflicts
+        if (room && room.host === socket.id) {
+            socket.to(data.roomId).emit('host_send_sync', { time: data.time, state: data.state });
+        }
     });
 
     // --- CHAT & VOICE ---
@@ -148,7 +150,6 @@ io.on('connection', (socket) => {
                         room.host = room.users[0].socketId;
                         room.users[0].isHost = true;
                         room.users[0].isCoHost = false;
-                        io.to(room.host).emit('you_are_host');
                         io.to(roomId).emit('chat_message', { system: true, text: `👑 ${room.users[0].username} is the new Room Host` });
                     }
                     io.to(roomId).emit('update_users', room.users);
@@ -166,4 +167,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => { console.log(`✅ SyncTube Server v26 running on port ${PORT}`); });
+server.listen(PORT, () => { console.log(`✅ SyncTube Server v28 running on port ${PORT}`); });
