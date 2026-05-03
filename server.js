@@ -33,7 +33,8 @@ io.on('connection', (socket) => {
         if (!rooms[roomId]) {
             rooms[roomId] = {
                 id: roomId, name: roomName, password: password || null,
-                host: socket.id, users: [], playlist: [], currentVideo: null
+                host: socket.id, users: [], playlist: [], 
+                currentVideo: null // Will hold {src, index, time, state}
             };
         }
 
@@ -46,6 +47,7 @@ io.on('connection', (socket) => {
         socket.join(roomId);
         callback({ success: true });
 
+        // Instantly sends the precise currentVideo object (which now contains real-time 'time' memory)
         socket.emit('room_data', { isHost: isHost, isCoHost: false, playlist: room.playlist, currentVideo: room.currentVideo });
         io.to(roomId).emit('update_users', room.users);
         io.to(roomId).emit('chat_message', { system: true, text: `${username} joined the party 🍿` });
@@ -61,7 +63,6 @@ io.on('connection', (socket) => {
                 if (u.socketId === socket.id) u.isHost = false;
                 if (u.socketId === data.targetId) { u.isHost = true; u.isCoHost = false; }
             });
-            // Single Source of Truth Update
             io.to(data.roomId).emit('update_users', room.users);
             io.to(data.roomId).emit('chat_message', { system: true, text: `👑 The Host Crown was transferred!` });
         }
@@ -85,7 +86,8 @@ io.on('connection', (socket) => {
         const room = rooms[data.roomId];
         const user = room?.users.find(u => u.socketId === socket.id);
         if (room && user && (user.isHost || user.isCoHost)) {
-            room.currentVideo = { src: data.src, name: data.name, index: data.index };
+            // Reset backend memory for the new video
+            room.currentVideo = { src: data.src, name: data.name, index: data.index, time: 0, state: 1 };
             io.to(data.roomId).emit('load_video', room.currentVideo);
         }
     });
@@ -111,15 +113,16 @@ io.on('connection', (socket) => {
         if (room && user && (user.isHost || user.isCoHost)) socket.to(data.roomId).emit('sync_pause', data.time);
     });
 
-    socket.on('request_sync_from_host', (data) => {
-        const room = rooms[data.roomId];
-        if (room && room.host) io.to(room.host).emit('viewer_requests_sync');
-    });
-
+    // 🟢 1-SECOND HEARTBEAT TRACKER 
     socket.on('broadcast_sync_data', (data) => {
         const room = rooms[data.roomId];
-        // Ensure only the absolute host broadcasts the heartbeat to prevent conflicts
+        // Ensure only the absolute host broadcasts the heartbeat
         if (room && room.host === socket.id) {
+            // Save the exact millisecond to server RAM for late joiners!
+            if (room.currentVideo) {
+                room.currentVideo.time = data.time;
+                room.currentVideo.state = data.state;
+            }
             socket.to(data.roomId).emit('host_send_sync', { time: data.time, state: data.state });
         }
     });
@@ -167,4 +170,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => { console.log(`✅ SyncTube Server v28 running on port ${PORT}`); });
+server.listen(PORT, () => { console.log(`✅ SyncTube Server v29 running on port ${PORT}`); });
