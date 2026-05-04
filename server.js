@@ -33,24 +33,45 @@ io.on('connection', (socket) => {
         if (!rooms[roomId]) {
             rooms[roomId] = {
                 id: roomId, name: roomName, password: password || null,
-                host: socket.id, users: [], playlist: [], 
-                currentVideo: null // Will hold {src, index, time, state}
+                host: null, users: [], playlist: [], currentVideo: null
             };
         }
 
         const room = rooms[roomId];
-        const isHost = room.host === socket.id;
 
-        const userObj = { socketId: socket.id, userId, username, photo, isHost, isCoHost: false };
+        // 🟢 GHOST CLONE FIX: Check if this user is already in the room (e.g. from a page refresh)
+        const existingUserIndex = room.users.findIndex(u => u.userId === userId);
+        let assignHost = false;
+        let assignCoHost = false;
+
+        if (existingUserIndex !== -1) {
+            // Inherit the roles from the ghost connection
+            assignHost = room.users[existingUserIndex].isHost;
+            assignCoHost = room.users[existingUserIndex].isCoHost;
+            // Remove the ghost connection
+            room.users.splice(existingUserIndex, 1);
+        } else if (room.users.length === 0) {
+            // First person to join the room gets the crown
+            assignHost = true;
+        }
+
+        const userObj = { socketId: socket.id, userId, username, photo, isHost: assignHost, isCoHost: assignCoHost };
         room.users.push(userObj);
+
+        // Ensure the room knows who the absolute host is
+        if (assignHost) room.host = socket.id;
 
         socket.join(roomId);
         callback({ success: true });
 
-        // Instantly sends the precise currentVideo object (which now contains real-time 'time' memory)
-        socket.emit('room_data', { isHost: isHost, isCoHost: false, playlist: room.playlist, currentVideo: room.currentVideo });
+        socket.emit('room_data', { isHost: assignHost, isCoHost: assignCoHost, playlist: room.playlist, currentVideo: room.currentVideo });
         io.to(roomId).emit('update_users', room.users);
-        io.to(roomId).emit('chat_message', { system: true, text: `${username} joined the party 🍿` });
+        
+        // Only announce in chat if it's a completely new join (not a refresh)
+        if (existingUserIndex === -1) {
+            io.to(roomId).emit('chat_message', { system: true, text: `${username} joined the party 🍿` });
+        }
+        
         emitActiveRooms();
     });
 
@@ -86,7 +107,6 @@ io.on('connection', (socket) => {
         const room = rooms[data.roomId];
         const user = room?.users.find(u => u.socketId === socket.id);
         if (room && user && (user.isHost || user.isCoHost)) {
-            // Reset backend memory for the new video
             room.currentVideo = { src: data.src, name: data.name, index: data.index, time: 0, state: 1 };
             io.to(data.roomId).emit('load_video', room.currentVideo);
         }
@@ -113,12 +133,10 @@ io.on('connection', (socket) => {
         if (room && user && (user.isHost || user.isCoHost)) socket.to(data.roomId).emit('sync_pause', data.time);
     });
 
-    // 🟢 1-SECOND HEARTBEAT TRACKER 
+    // 1.0s HEARTBEAT SAVER
     socket.on('broadcast_sync_data', (data) => {
         const room = rooms[data.roomId];
-        // Ensure only the absolute host broadcasts the heartbeat
         if (room && room.host === socket.id) {
-            // Save the exact millisecond to server RAM for late joiners!
             if (room.currentVideo) {
                 room.currentVideo.time = data.time;
                 room.currentVideo.state = data.state;
@@ -143,21 +161,27 @@ io.on('connection', (socket) => {
             if (userIndex !== -1) {
                 const user = room.users[userIndex];
                 socket.to(roomId).emit('voice_user_left', { socketId: socket.id });
-                io.to(roomId).emit('chat_message', { system: true, text: `${user.username} left the party 👋` });
-                room.users.splice(userIndex, 1);
-
-                if (room.users.length === 0) {
-                    delete rooms[roomId];
-                } else {
-                    if (user.isHost) {
-                        room.host = room.users[0].socketId;
-                        room.users[0].isHost = true;
-                        room.users[0].isCoHost = false;
-                        io.to(roomId).emit('chat_message', { system: true, text: `👑 ${room.users[0].username} is the new Room Host` });
+                
+                // Set a short timeout to see if they instantly reconnect (page refresh)
+                // If they don't reconnect in 3 seconds, announce they left and hand over host.
+                setTimeout(() => {
+                    const currentRoom = rooms[roomId];
+                    if(currentRoom && !currentRoom.users.find(u => u.userId === user.userId)) {
+                        io.to(roomId).emit('chat_message', { system: true, text: `${user.username} left the party 👋` });
+                        
+                        if (user.isHost && currentRoom.users.length > 0) {
+                            currentRoom.host = currentRoom.users[0].socketId;
+                            currentRoom.users[0].isHost = true;
+                            currentRoom.users[0].isCoHost = false;
+                            io.to(roomId).emit('chat_message', { system: true, text: `👑 ${currentRoom.users[0].username} is the new Room Host` });
+                        }
+                        io.to(roomId).emit('update_users', currentRoom.users);
                     }
-                    io.to(roomId).emit('update_users', room.users);
-                }
-                emitActiveRooms();
+                    if (currentRoom && currentRoom.users.length === 0) delete rooms[roomId];
+                    emitActiveRooms();
+                }, 3000);
+
+                room.users.splice(userIndex, 1);
                 break;
             }
         }
@@ -170,4 +194,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => { console.log(`✅ SyncTube Server v29 running on port ${PORT}`); });
+server.listen(PORT, () => { console.log(`✅ SyncTube Server v33 running on port ${PORT}`); });
