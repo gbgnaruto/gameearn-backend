@@ -17,4 +17,4 @@ RUN npm install
 COPY . .
 
 # Start your Node server (change 'index.js' if your main file is named differently)
-CMD ["node", "index.js"]
+CMD ["node", "server.js"]
