@@ -10,7 +10,7 @@ const app = express();
 app.use(cors());
 app.use(express.json()); // Essential for parsing POST bodies
 
-// Ensure the public directory exists for static playback
+// Ensure the root public directory exists
 const publicDir = path.join(__dirname, 'public');
 if (!fs.existsSync(publicDir)) {
     fs.mkdirSync(publicDir);
@@ -22,7 +22,7 @@ app.get('/', (req, res) => {
     res.status(200).send('SyncTube Backend is Awake and Running! 🚀');
 });
 
-// --- STREAMLINED & SECURED STREAM CONVERSION ENDPOINT ---
+// --- SECURED HLS COMPATIBLE STREAM CONVERSION ENDPOINT ---
 app.post('/api/convert', (req, res) => {
     const { videoUrl } = req.body;
 
@@ -36,40 +36,52 @@ app.post('/api/convert', (req, res) => {
         return res.status(400).send({ error: 'Invalid URL format' });
     }
 
-    const outputFileName = `stream_${Date.now()}.mpd`;
-    const outputPath = path.join(publicDir, outputFileName);
+    // Isolate this stream session in its own unique subfolder to avoid segment collisions
+    const streamId = `stream_${Date.now()}`;
+    const streamDir = path.join(publicDir, streamId);
+    if (!fs.existsSync(streamDir)) {
+        fs.mkdirSync(streamDir);
+    }
 
-    // Dynamic arguments array passed cleanly to binary execution
+    const playlistName = 'playlist.m3u8';
+    const outputPath = path.join(streamDir, playlistName);
+
+    // Optimized HLS Arguments Array
+    // -map 0:a? captures all existing audio tracks and multiplexes them inside the TS segments
     const args = [
         '-y', 
         '-i', videoUrl, 
-        '-map', '0:v', 
-        '-map', '0:a', 
+        '-map', '0:v:0', 
+        '-map', '0:a?', 
         '-c:v', 'copy', 
         '-c:a', 'aac', 
-        '-f', 'dash', 
+        '-f', 'hls',
+        '-hls_time', '6',                  // Target length for each TS segment (seconds)
+        '-hls_list_size', '0',             // 0 keeps all segments listed in the manifest (VOD mode)
+        '-hls_playlist_type', 'vod',       // Configures manifest type explicitly for VOD playback
+        '-hls_segment_filename', path.join(streamDir, 'seg_%03d.ts'), // Segment naming pattern
         outputPath
     ];
 
-    console.log(`[FFmpeg] Initiating stream allocation for: ${videoUrl}`);
+    console.log(`[FFmpeg] Initiating HLS stream allocation for: ${videoUrl}`);
 
-    // Using spawn to avoid maxBuffer overflows on extended media logs
+    // Stream the process via spawn to securely handle large transcode tracking logs
     const ffmpegProcess = spawn('ffmpeg', args);
 
-    // Optional: Log errors or output streams if tracking debugging steps
     ffmpegProcess.stderr.on('data', (data) => {
-        // FFmpeg writes progress logs to stderr by design. Keep open for debugging if needed:
+        // Optional: Uncomment for live server log debugging of transcoding steps
         // console.log(`[FFmpeg Progress]: ${data}`);
     });
 
     ffmpegProcess.on('close', (code) => {
         if (code !== 0) {
             console.error(`[FFmpeg] Process exited with failure code: ${code}`);
-            return res.status(500).send({ error: 'Conversion pipeline failed' });
+            return res.status(500).send({ error: 'HLS Conversion pipeline failed' });
         }
         
-        console.log(`[FFmpeg] Successfully generated manifest: ${outputFileName}`);
-        res.send({ status: 'Success', manifestUrl: `/public/${outputFileName}` });
+        console.log(`[FFmpeg] Successfully generated HLS manifest: ${streamId}/${playlistName}`);
+        // Return the clean, web-accessible path to your new HLS playlist index
+        res.send({ status: 'Success', manifestUrl: `/public/${streamId}/${playlistName}` });
     });
 
     ffmpegProcess.on('error', (err) => {
@@ -115,7 +127,6 @@ io.on('connection', (socket) => {
             isARefresh = true;
             const oldUserInstance = room.users[existingUserIndex];
             
-            // Clear pending removal timer to save state
             if (oldUserInstance.timeoutId) {
                 clearTimeout(oldUserInstance.timeoutId);
             }
@@ -126,7 +137,6 @@ io.on('connection', (socket) => {
             // Purge the old socket profile placeholder
             room.users.splice(existingUserIndex, 1);
         } else if (room.users.filter(u => !u.isPendingRemoval).length === 0) {
-            // Crown the user if no active users are currently present
             assignHost = true;
         }
 
@@ -149,11 +159,8 @@ io.on('connection', (socket) => {
         callback({ success: true });
 
         socket.emit('room_data', { isHost: assignHost, isCoHost: assignCoHost, playlist: room.playlist, currentVideo: room.currentVideo });
-        
-        // Push updated data strictly to active system participants
         io.to(roomId).emit('update_users', room.users.filter(u => !u.isPendingRemoval));
 
-        // Only alert chat rooms on genuine arrivals, ignoring simple page refreshes
         if (!isARefresh) {
             io.to(roomId).emit('chat_message', { system: true, text: `${username} joined the party 🍿` });
         }
@@ -248,22 +255,17 @@ io.on('connection', (socket) => {
                 const user = room.users[userIndex];
                 socket.to(roomId).emit('voice_user_left', { socketId: socket.id });
 
-                // Flag the element instead of instant slicing to preserve state during short drops/refreshes
                 user.isPendingRemoval = true;
 
                 user.timeoutId = setTimeout(() => {
                     const currentRoom = rooms[roomId];
                     if (currentRoom) {
-                        // Re-verify that user did not return under a clean connection profile
                         const freshInstance = currentRoom.users.find(u => u.userId === user.userId && !u.isPendingRemoval);
                         
                         if (!freshInstance) {
-                            // Erase user permanently from memory cache
                             currentRoom.users = currentRoom.users.filter(u => u.userId !== user.userId);
-                            
                             io.to(roomId).emit('chat_message', { system: true, text: `${user.username} left the party 👋` });
 
-                            // Dynamic Host Reassignment
                             if (user.isHost && currentRoom.users.length > 0) {
                                 currentRoom.host = currentRoom.users[0].socketId;
                                 currentRoom.users[0].isHost = true;
@@ -281,7 +283,6 @@ io.on('connection', (socket) => {
                     emitActiveRooms();
                 }, 3000);
 
-                // Update room listing state immediately for UI performance feedback
                 io.to(roomId).emit('update_users', room.users.filter(u => !u.isPendingRemoval));
                 break;
             }
