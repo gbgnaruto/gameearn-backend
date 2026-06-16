@@ -17,6 +17,96 @@ if (!fs.existsSync(publicDir)) {
 }
 app.use('/public', express.static(publicDir));
 
+// ── Disk Cleanup — auto-delete stream folders older than 4 hours ──
+// Render free tier has ~500MB disk. A 2hr film generates ~1.5GB of .ts segments.
+// Without cleanup the server crashes on the 2nd or 3rd conversion.
+const STREAM_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
+const CLEANUP_INTERVAL_MS = 30 * 60 * 1000;    // run every 30 minutes
+
+function cleanOldStreams() {
+    try {
+        const entries = fs.readdirSync(publicDir);
+        let deleted = 0, freed = 0;
+
+        for (const name of entries) {
+            if (!name.startsWith('stream_')) continue;
+            const dir = path.join(publicDir, name);
+            try {
+                const stat = fs.statSync(dir);
+                if (!stat.isDirectory()) continue;
+                const ageMs = Date.now() - stat.mtimeMs;
+                if (ageMs < STREAM_MAX_AGE_MS) continue;
+
+                // Calculate folder size before deleting
+                const files = fs.readdirSync(dir);
+                for (const f of files) {
+                    try { freed += fs.statSync(path.join(dir, f)).size; } catch(_) {}
+                    try { fs.unlinkSync(path.join(dir, f)); } catch(_) {}
+                }
+                fs.rmdirSync(dir);
+                deleted++;
+
+                // Also remove from jobs store
+                for (const [jid, job] of Object.entries(jobs)) {
+                    if (job.streamId === name) {
+                        delete jobs[jid];
+                        break;
+                    }
+                }
+            } catch(e) {
+                console.warn(`[Cleanup] Could not remove ${name}:`, e.message);
+            }
+        }
+
+        if (deleted > 0) {
+            const mb = (freed / 1024 / 1024).toFixed(1);
+            console.log(`[Cleanup] Removed ${deleted} stream(s), freed ${mb} MB`);
+        }
+    } catch(e) {
+        console.error('[Cleanup] Error scanning public dir:', e.message);
+    }
+}
+
+// Run cleanup on startup (clears leftover files from previous deploys)
+cleanOldStreams();
+// Then run every 30 minutes
+setInterval(cleanOldStreams, CLEANUP_INTERVAL_MS);
+
+// Manual cleanup endpoint — callable from browser for immediate purge
+app.post('/api/cleanup', (req, res) => {
+    cleanOldStreams();
+    const dirs = fs.readdirSync(publicDir).filter(n => n.startsWith('stream_')).length;
+    res.json({ status: 'ok', remainingStreams: dirs });
+});
+
+// Disk usage endpoint — shows how full the server is
+app.get('/api/disk', (req, res) => {
+    try {
+        let totalBytes = 0;
+        const streams = [];
+        for (const name of fs.readdirSync(publicDir)) {
+            if (!name.startsWith('stream_')) continue;
+            const dir = path.join(publicDir, name);
+            let size = 0;
+            try {
+                for (const f of fs.readdirSync(dir)) {
+                    try { size += fs.statSync(path.join(dir, f)).size; } catch(_) {}
+                }
+            } catch(_) {}
+            const ageMins = Math.round((Date.now() - fs.statSync(dir).mtimeMs) / 60000);
+            totalBytes += size;
+            streams.push({ name, sizeMb: (size/1024/1024).toFixed(1), ageMins });
+        }
+        res.json({
+            totalMb: (totalBytes/1024/1024).toFixed(1),
+            streamCount: streams.length,
+            streams: streams.sort((a,b) => b.ageMins - a.ageMins)
+        });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // Keep-Alive Pulse Route
 app.get('/', (req, res) => {
     res.status(200).send('SyncTube Backend is Awake and Running! 🚀');
@@ -119,42 +209,99 @@ app.post('/api/convert', (req, res) => {
         console.log('[Thumb] Thumbnail generation failed:', e.message);
     }
 
-    // Build map args and var_stream_map for multi-audio HLS
-    const mapArgs = ['-map', '0:v:0'];
-    let varStreamMap = 'v:0';
-    for (let i = 0; i < numAudio; i++) {
-        mapArgs.push('-map', `0:a:${i}`);
-        const lang = audioLangs[i]?.lang || '';
-        const label = audioLangs[i]?.label || `Track ${i+1}`;
-        varStreamMap += `,a:${i},agroup:audio,name:${label.replace(/[^a-zA-Z0-9]/g,'_')},language:${lang||'und'},default:${i===0?'yes':'no'}`;
-    }
+    // ── Build FFmpeg args for multi-audio HLS ──
+    // FFmpeg 4.3 strategy: transcode video+primary audio together,
+    // then transcode each extra audio track separately.
+    // We then craft a master playlist that links them all as EXT-X-MEDIA groups.
+    // This is the most reliable approach for HLS.js audioTracks support.
 
-    const args = [
-        '-y',
+    if (numAudio <= 1) {
+        // ── Single audio: simple single-output HLS ──
+        const args = [
+            '-y',
+            '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            '-headers', 'Referer: https://www.google.com/\r\nAccept: */*\r\nAccept-Language: en-US,en;q=0.9\r\n',
+            '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+            '-i', videoUrl,
+            '-map', '0:v:0', '-map', '0:a:0',
+            '-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-b:a', '192k',
+            '-max_muxing_queue_size', '9999',
+            '-f', 'hls', '-hls_time', '6', '-hls_list_size', '0',
+            '-hls_flags', 'append_list',
+            '-hls_segment_filename', path.join(streamDir, 'seg_%03d.ts'),
+            outputPath
+        ];
+    }
+    // fall through to spawn below
+
+    // ── Multi-audio: one FFmpeg pass per audio track + video ──
+    // Pass 0: video + audio track 0 (default)
+    // Pass 1..N: audio tracks 1..N only (no video, much faster)
+    const commonInput = [
         '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         '-headers', 'Referer: https://www.google.com/\r\nAccept: */*\r\nAccept-Language: en-US,en;q=0.9\r\n',
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '5',
-        '-i', videoUrl,
-        ...mapArgs,
-        '-c:v', 'copy',
-        '-c:a', 'aac',
-        '-ac', '2',
-        '-b:a', '192k',
-        '-max_muxing_queue_size', '9999',
-        '-f', 'hls',
-        '-hls_time', '6',
-        '-hls_list_size', '0',
-        '-hls_flags', 'append_list+independent_segments',
-        // var_stream_map tells FFmpeg to write separate audio playlists
-        // which is what HLS.js reads to populate its audioTracks array
-        ...(numAudio > 1 ? ['-var_stream_map', varStreamMap,
-            '-master_pl_name', 'playlist.m3u8',
-            '-hls_segment_filename', path.join(streamDir, 'seg_%v_%03d.ts'),
-            path.join(streamDir, 'stream_%v.m3u8')]
-          : ['-hls_segment_filename', path.join(streamDir, 'seg_%03d.ts'), outputPath])
+        '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+        '-i', videoUrl
     ];
+
+    // Primary pass: video + track 0
+    const args = [
+        '-y',
+        ...commonInput,
+        '-map', '0:v:0', '-map', '0:a:0',
+        '-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-b:a', '192k',
+        '-max_muxing_queue_size', '9999',
+        '-f', 'hls', '-hls_time', '6', '-hls_list_size', '0',
+        '-hls_flags', 'append_list',
+        '-hls_segment_filename', path.join(streamDir, 'seg_0_%03d.ts'),
+        path.join(streamDir, 'stream_0.m3u8')
+    ];
+
+    // Spawn extra audio-only passes for tracks 1..N (parallel)
+    for (let i = 1; i < numAudio; i++) {
+        const aArgs = [
+            '-y',
+            ...commonInput,
+            '-map', `0:a:${i}`,
+            '-vn',
+            '-c:a', 'aac', '-ac', '2', '-b:a', '192k',
+            '-f', 'hls', '-hls_time', '6', '-hls_list_size', '0',
+            '-hls_flags', 'append_list',
+            '-hls_segment_filename', path.join(streamDir, `seg_${i}_%03d.ts`),
+            path.join(streamDir, `stream_${i}.m3u8`)
+        ];
+        const aProc = spawn('ffmpeg', aArgs);
+        aProc.stderr.on('data', () => {}); // suppress
+        aProc.on('close', code => console.log(`[FFmpeg] Audio track ${i} done (code ${code})`));
+        aProc.on('error', e => console.error(`[FFmpeg] Audio track ${i} error:`, e.message));
+    }
+
+    // After primary pass finishes, build the master playlist
+    // This is called from the proc.on('close') handler below
+    jobs[jobId]._buildMaster = () => {
+        try {
+            const label0 = audioLangs[0]?.label || 'Track 1';
+            const lang0  = audioLangs[0]?.lang  || 'und';
+
+            let master = '#EXTM3U\n#EXT-X-VERSION:3\n\n';
+
+            // Add EXT-X-MEDIA entries for each audio track
+            for (let i = 0; i < numAudio; i++) {
+                const label = audioLangs[i]?.label || `Track ${i+1}`;
+                const lang  = audioLangs[i]?.lang  || 'und';
+                const def   = i === 0 ? 'YES' : 'NO';
+                const uri   = i === 0 ? 'stream_0.m3u8' : `stream_${i}.m3u8`;
+                master += `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${label}",LANGUAGE="${lang}",DEFAULT=${def},AUTOSELECT=${def},URI="${uri}"\n`;
+            }
+
+            // Video stream pointing to stream_0 (which has video+default audio)
+            master += `\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="audio"\nstream_0.m3u8\n`;
+            fs.writeFileSync(path.join(streamDir, 'playlist.m3u8'), master);
+            console.log(`[Master] Job ${jobId}: master playlist written with ${numAudio} audio tracks`);
+        } catch(e) {
+            console.error('[Master] Failed to write master playlist:', e.message);
+        }
+    };
 
     console.log(`[FFmpeg] Live job ${jobId} started for: ${videoUrl}`);
     const proc = spawn('ffmpeg', args);
@@ -203,13 +350,16 @@ app.post('/api/convert', (req, res) => {
     proc.on('close', code => {
         segWatcher.close();
         if (code === 0) {
+            // Build master playlist for multi-audio before marking done
+            if (jobs[jobId]?._buildMaster) {
+                jobs[jobId]._buildMaster();
+                delete jobs[jobId]._buildMaster;
+            }
             console.log(`[FFmpeg] Job ${jobId} fully done ✅`);
             jobs[jobId].status = 'done';
         } else {
             console.error(`[FFmpeg] Job ${jobId} failed with code ${code}`);
-            // Only mark as error if we never went live — if we did go live,
-            // the user is already watching and partial content is fine
-            if (jobs[jobId].status === 'pending') {
+            if (jobs[jobId]?.status === 'pending') {
                 jobs[jobId].status = 'error';
                 jobs[jobId].error  = `FFmpeg exited with code ${code}`;
             }
