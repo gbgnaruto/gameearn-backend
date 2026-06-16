@@ -62,19 +62,61 @@ app.post('/api/convert', (req, res) => {
     // Reply instantly — frontend polls status
     res.json({ status: 'queued', jobId });
 
-    // Probe the file first to count audio streams
-    // Then build separate var_stream_map entries so HLS.js sees real alternate audio renditions
+    // ── Feature 4+7: Probe for title, duration, audio track names ──
     let numAudio = 1;
+    let videoTitle = '';
+    let videoDuration = 0;
+    let audioLangs = [];
+    const { execSync } = require('child_process');
+
     try {
-        const { execSync } = require('child_process');
-        const probe = execSync(
-            `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${videoUrl.replace(/"/g,'\"')}"`,
-            { timeout: 15000 }
-        ).toString().trim();
-        numAudio = probe.split('\n').filter(Boolean).length || 1;
-        console.log(`[FFmpeg] Job ${jobId}: detected ${numAudio} audio stream(s)`);
+        const probeJson = execSync(
+            `ffprobe -v quiet -print_format json -show_format -show_streams "${videoUrl.replace(/"/g,'\"')}"`,
+            { timeout: 20000 }
+        ).toString();
+        const probe = JSON.parse(probeJson);
+
+        // Title from metadata
+        videoTitle = probe.format?.tags?.title || probe.format?.tags?.TITLE || '';
+        videoDuration = parseFloat(probe.format?.duration || 0);
+
+        // Audio streams with real language names
+        const audioStreams = (probe.streams || []).filter(s => s.codec_type === 'audio');
+        numAudio = audioStreams.length || 1;
+        audioLangs = audioStreams.map((s, i) => {
+            const lang = s.tags?.language || s.tags?.LANGUAGE || '';
+            const title = s.tags?.title || s.tags?.TITLE || '';
+            // Build a human-readable label: prefer title, then language code mapped to name
+            const langMap = { eng:'English', hin:'Hindi', jpn:'Japanese', tam:'Tamil',
+                              tel:'Telugu', fra:'French', spa:'Spanish', kor:'Korean',
+                              ara:'Arabic', por:'Portuguese', deu:'German', zho:'Chinese' };
+            const label = title || langMap[lang] || (lang ? lang.toUpperCase() : `Track ${i+1}`);
+            return { index: i, lang, label };
+        });
+
+        console.log(`[Probe] Job ${jobId}: title="${videoTitle}" duration=${videoDuration}s audio=${numAudio}`);
+        console.log(`[Probe] Audio tracks:`, audioLangs.map(a => a.label).join(', '));
+
     } catch(e) {
-        console.log('[FFmpeg] ffprobe failed, assuming 1 audio stream');
+        console.log('[Probe] ffprobe failed:', e.message);
+    }
+
+    // Store metadata in job for frontend to retrieve
+    jobs[jobId].title    = videoTitle;
+    jobs[jobId].duration = videoDuration;
+    jobs[jobId].audioLangs = audioLangs;
+
+    // ── Feature 8: Generate thumbnail from frame at 10s ──
+    const thumbPath = path.join(streamDir, 'thumb.jpg');
+    try {
+        execSync(
+            `ffmpeg -y -ss 10 -i "${videoUrl.replace(/"/g,'\"')}" -frames:v 1 -q:v 2 -vf scale=320:-1 "${thumbPath}"`,
+            { timeout: 25000 }
+        );
+        jobs[jobId].thumbUrl = `/public/${streamId}/thumb.jpg`;
+        console.log(`[Thumb] Job ${jobId}: thumbnail generated`);
+    } catch(e) {
+        console.log('[Thumb] Thumbnail generation failed:', e.message);
     }
 
     // Build map args and var_stream_map for multi-audio HLS
@@ -82,7 +124,9 @@ app.post('/api/convert', (req, res) => {
     let varStreamMap = 'v:0';
     for (let i = 0; i < numAudio; i++) {
         mapArgs.push('-map', `0:a:${i}`);
-        varStreamMap += `,a:${i},agroup:audio,language:track${i+1},default:${i===0?'yes':'no'}`;
+        const lang = audioLangs[i]?.lang || '';
+        const label = audioLangs[i]?.label || `Track ${i+1}`;
+        varStreamMap += `,a:${i},agroup:audio,name:${label.replace(/[^a-zA-Z0-9]/g,'_')},language:${lang||'und'},default:${i===0?'yes':'no'}`;
     }
 
     const args = [
@@ -129,11 +173,30 @@ app.post('/api/convert', (req, res) => {
         }
     });
 
+    // ── Feature 5: Parse FFmpeg stderr for real-time progress ──
+    let ffmpegBuffer = '';
     proc.stderr.on('data', d => {
-        const line = d.toString().trim();
-        if (line && line.includes('time=')) {
-            // Only log progress lines to avoid flooding
-            console.log(`[FFmpeg ${jobId}] ${line}`);
+        ffmpegBuffer += d.toString();
+        const lines = ffmpegBuffer.split('\r');
+        ffmpegBuffer = lines.pop(); // keep incomplete line
+
+        for (const line of lines) {
+            if (!line.includes('time=')) continue;
+            // Parse time= field: time=01:23:45.67
+            const m = line.match(/time=([\d:]+\.?\d*)/);
+            if (m) {
+                const parts = m[1].split(':').map(Number);
+                const secs = parts.length === 3
+                    ? parts[0]*3600 + parts[1]*60 + parts[2]
+                    : parts[0]*60 + parts[1];
+                jobs[jobId].progress = {
+                    currentTime: secs,
+                    duration: jobs[jobId].duration || 0,
+                    pct: jobs[jobId].duration > 0
+                        ? Math.min(99, Math.round((secs / jobs[jobId].duration) * 100))
+                        : null
+                };
+            }
         }
     });
 
@@ -171,19 +234,28 @@ app.get('/api/convert/status/:jobId', (req, res) => {
     if (!job) return res.status(404).json({ error: 'Job not found' });
 
     if (job.status === 'live' || job.status === 'done') {
-        // Return the manifest URL — HLS.js will load it and find segments already there
         return res.json({
             status: 'Success',
             manifestUrl: job.manifestUrl,
             segments: job.segments,
-            live: job.status === 'live'  // frontend can show "⚡ Live Processing" badge
+            live: job.status === 'live',
+            title: job.title || '',
+            duration: job.duration || 0,
+            audioLangs: job.audioLangs || [],
+            thumbUrl: job.thumbUrl ? `https://gameearn-backend.onrender.com${job.thumbUrl}` : ''
         });
     }
     if (job.status === 'error') {
         return res.json({ status: 'Error', error: job.error });
     }
-    // Still buffering initial segments
-    res.json({ status: 'pending', segments: job.segments || 0 });
+    // Still buffering — return progress for frontend display
+    res.json({
+        status: 'pending',
+        segments: job.segments || 0,
+        progress: job.progress || null,
+        title: job.title || '',
+        duration: job.duration || 0
+    });
 });
 
 // Health check — confirms FFmpeg is present
