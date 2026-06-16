@@ -54,11 +54,23 @@ app.post('/api/convert', (req, res) => {
     // Run FFmpeg in the background — no HTTP timeout risk
     const args = [
         '-y',
+        // Spoof a real browser so Hubcloud/CFStorage don't block the server IP
+        '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        '-headers', 'Referer: https://www.google.com/\r\nAccept: */*\r\nAccept-Language: en-US,en;q=0.9\r\n',
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',
         '-i', videoUrl,
         '-map', '0:v:0',
         '-map', '0:a?',
         '-c:v', 'copy',
+        // Transcode each AC3 track to AAC stereo (downmix 5.1 -> 2ch)
+        // This cuts per-track memory use in half and eliminates the buffer overflow
         '-c:a', 'aac',
+        '-ac', '2',           // Downmix all audio to stereo
+        '-b:a', '192k',       // 192k per track — plenty for dialogue/music
+        // Fix: raise the muxing queue so both audio tracks buffer without colliding
+        '-max_muxing_queue_size', '9999',
         '-f', 'hls',
         '-hls_time', '6',
         '-hls_list_size', '0',
