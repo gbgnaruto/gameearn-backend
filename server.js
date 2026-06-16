@@ -81,8 +81,8 @@ app.post('/api/convert', (req, res) => {
     const mapArgs = ['-map', '0:v:0'];
     let varStreamMap = 'v:0';
     for (let i = 0; i < numAudio; i++) {
-        mapArgs.push('-map', \`0:a:\${i}\`);
-        varStreamMap += \`,a:\${i},agroup:audio,language:track\${i+1},default:\${i===0?'yes':'no'}\`;
+        mapArgs.push('-map', `0:a:${i}`);
+        varStreamMap += `,a:${i},agroup:audio,language:track${i+1},default:${i===0?'yes':'no'}`;
     }
 
     const args = [
