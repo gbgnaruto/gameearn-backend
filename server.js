@@ -25,7 +25,11 @@ app.get('/', (req, res) => {
 // In-memory job store — tracks all active/completed conversions
 const jobs = {};
 
-// --- STEP 1: Start conversion, return job ID immediately (avoids timeout) ---
+// How many 6-second segments must exist before we tell the frontend to start playing
+// 5 segments = 30 seconds of buffer — enough to start smoothly
+const LIVE_START_SEGMENTS = 5;
+
+// --- STEP 1: Start live-streaming conversion, return job ID immediately ---
 app.post('/api/convert', (req, res) => {
     const { videoUrl } = req.body;
 
@@ -38,84 +42,148 @@ app.post('/api/convert', (req, res) => {
         return res.status(400).json({ error: 'Invalid URL format' });
     }
 
-    const jobId   = `job_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+    const jobId    = `job_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
     const streamId = `stream_${Date.now()}`;
     const streamDir = path.join(publicDir, streamId);
     if (!fs.existsSync(streamDir)) fs.mkdirSync(streamDir, { recursive: true });
 
     const outputPath = path.join(streamDir, 'playlist.m3u8');
 
-    // Register job as pending before spawning
-    jobs[jobId] = { status: 'pending', streamId, startedAt: Date.now() };
+    // Register job immediately
+    jobs[jobId] = {
+        status: 'pending',
+        streamId,
+        streamDir,
+        manifestUrl: `/public/${streamId}/playlist.m3u8`,
+        startedAt: Date.now(),
+        segments: 0
+    };
 
-    // Respond immediately with the job ID — frontend polls /api/convert/status/:jobId
+    // Reply instantly — frontend polls status
     res.json({ status: 'queued', jobId });
 
-    // Run FFmpeg in the background — no HTTP timeout risk
+    // Probe the file first to count audio streams
+    // Then build separate var_stream_map entries so HLS.js sees real alternate audio renditions
+    let numAudio = 1;
+    try {
+        const { execSync } = require('child_process');
+        const probe = execSync(
+            `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${videoUrl.replace(/"/g,'\"')}"`,
+            { timeout: 15000 }
+        ).toString().trim();
+        numAudio = probe.split('\n').filter(Boolean).length || 1;
+        console.log(`[FFmpeg] Job ${jobId}: detected ${numAudio} audio stream(s)`);
+    } catch(e) {
+        console.log('[FFmpeg] ffprobe failed, assuming 1 audio stream');
+    }
+
+    // Build map args and var_stream_map for multi-audio HLS
+    const mapArgs = ['-map', '0:v:0'];
+    let varStreamMap = 'v:0';
+    for (let i = 0; i < numAudio; i++) {
+        mapArgs.push('-map', \`0:a:\${i}\`);
+        varStreamMap += \`,a:\${i},agroup:audio,language:track\${i+1},default:\${i===0?'yes':'no'}\`;
+    }
+
     const args = [
         '-y',
-        // Spoof a real browser so Hubcloud/CFStorage don't block the server IP
         '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         '-headers', 'Referer: https://www.google.com/\r\nAccept: */*\r\nAccept-Language: en-US,en;q=0.9\r\n',
         '-reconnect', '1',
         '-reconnect_streamed', '1',
         '-reconnect_delay_max', '5',
         '-i', videoUrl,
-        '-map', '0:v:0',
-        '-map', '0:a?',
+        ...mapArgs,
         '-c:v', 'copy',
-        // Transcode each AC3 track to AAC stereo (downmix 5.1 -> 2ch)
-        // This cuts per-track memory use in half and eliminates the buffer overflow
         '-c:a', 'aac',
-        '-ac', '2',           // Downmix all audio to stereo
-        '-b:a', '192k',       // 192k per track — plenty for dialogue/music
-        // Fix: raise the muxing queue so both audio tracks buffer without colliding
+        '-ac', '2',
+        '-b:a', '192k',
         '-max_muxing_queue_size', '9999',
         '-f', 'hls',
         '-hls_time', '6',
         '-hls_list_size', '0',
-        '-hls_playlist_type', 'vod',
-        '-hls_segment_filename', path.join(streamDir, 'seg_%03d.ts'),
-        outputPath
+        '-hls_flags', 'append_list+independent_segments',
+        // var_stream_map tells FFmpeg to write separate audio playlists
+        // which is what HLS.js reads to populate its audioTracks array
+        ...(numAudio > 1 ? ['-var_stream_map', varStreamMap,
+            '-master_pl_name', 'playlist.m3u8',
+            '-hls_segment_filename', path.join(streamDir, 'seg_%v_%03d.ts'),
+            path.join(streamDir, 'stream_%v.m3u8')]
+          : ['-hls_segment_filename', path.join(streamDir, 'seg_%03d.ts'), outputPath])
     ];
 
-    console.log(`[FFmpeg] Job ${jobId} started for: ${videoUrl}`);
+    console.log(`[FFmpeg] Live job ${jobId} started for: ${videoUrl}`);
     const proc = spawn('ffmpeg', args);
+
+    // Watch for new segment files — update segment count in real time
+    const segWatcher = fs.watch(streamDir, (event, filename) => {
+        if (filename && filename.endsWith('.ts')) {
+            const segs = fs.readdirSync(streamDir).filter(f => f.endsWith('.ts')).length;
+            jobs[jobId].segments = segs;
+
+            // Once we have enough buffer, tell the frontend it can start playing
+            if (jobs[jobId].status === 'pending' && segs >= LIVE_START_SEGMENTS) {
+                console.log(`[FFmpeg] Job ${jobId} live — ${segs} segments ready, signalling frontend`);
+                jobs[jobId].status = 'live';
+            }
+        }
+    });
 
     proc.stderr.on('data', d => {
         const line = d.toString().trim();
-        if (line) console.log(`[FFmpeg ${jobId}] ${line}`);
+        if (line && line.includes('time=')) {
+            // Only log progress lines to avoid flooding
+            console.log(`[FFmpeg ${jobId}] ${line}`);
+        }
     });
 
     proc.on('close', code => {
+        segWatcher.close();
         if (code === 0) {
-            console.log(`[FFmpeg] Job ${jobId} completed ✅`);
-            jobs[jobId] = { status: 'done', manifestUrl: `/public/${streamId}/playlist.m3u8` };
+            console.log(`[FFmpeg] Job ${jobId} fully done ✅`);
+            jobs[jobId].status = 'done';
         } else {
             console.error(`[FFmpeg] Job ${jobId} failed with code ${code}`);
-            jobs[jobId] = { status: 'error', error: `FFmpeg exited with code ${code}` };
+            // Only mark as error if we never went live — if we did go live,
+            // the user is already watching and partial content is fine
+            if (jobs[jobId].status === 'pending') {
+                jobs[jobId].status = 'error';
+                jobs[jobId].error  = `FFmpeg exited with code ${code}`;
+            }
         }
     });
 
     proc.on('error', err => {
+        segWatcher.close();
         console.error(`[FFmpeg] Job ${jobId} spawn error:`, err);
-        jobs[jobId] = { status: 'error', error: err.message };
+        if (jobs[jobId].status === 'pending') {
+            jobs[jobId].status = 'error';
+            jobs[jobId].error  = err.message;
+        }
     });
 });
 
-// --- STEP 2: Frontend polls this until status is 'done' or 'error' ---
+// --- STEP 2: Frontend polls this every 3s ---
+// Returns 'pending' until 30s of video is ready, then 'Success' to start playback
+// FFmpeg keeps writing segments in the background while the user watches
 app.get('/api/convert/status/:jobId', (req, res) => {
     const job = jobs[req.params.jobId];
     if (!job) return res.status(404).json({ error: 'Job not found' });
 
-    if (job.status === 'done') {
-        return res.json({ status: 'Success', manifestUrl: job.manifestUrl });
+    if (job.status === 'live' || job.status === 'done') {
+        // Return the manifest URL — HLS.js will load it and find segments already there
+        return res.json({
+            status: 'Success',
+            manifestUrl: job.manifestUrl,
+            segments: job.segments,
+            live: job.status === 'live'  // frontend can show "⚡ Live Processing" badge
+        });
     }
     if (job.status === 'error') {
         return res.json({ status: 'Error', error: job.error });
     }
-    // Still running
-    res.json({ status: 'pending' });
+    // Still buffering initial segments
+    res.json({ status: 'pending', segments: job.segments || 0 });
 });
 
 // Health check — confirms FFmpeg is present
