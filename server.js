@@ -22,72 +22,99 @@ app.get('/', (req, res) => {
     res.status(200).send('SyncTube Backend is Awake and Running! 🚀');
 });
 
-// --- SECURED HLS COMPATIBLE STREAM CONVERSION ENDPOINT ---
+// In-memory job store — tracks all active/completed conversions
+const jobs = {};
+
+// --- STEP 1: Start conversion, return job ID immediately (avoids timeout) ---
 app.post('/api/convert', (req, res) => {
     const { videoUrl } = req.body;
 
     if (!videoUrl || typeof videoUrl !== 'string') {
-        return res.status(400).send({ error: 'Valid Video URL required' });
+        return res.status(400).json({ error: 'Valid Video URL required' });
     }
-
     try {
-        new URL(videoUrl); // Validate string structure as a true URI
+        new URL(videoUrl);
     } catch (_) {
-        return res.status(400).send({ error: 'Invalid URL format' });
+        return res.status(400).json({ error: 'Invalid URL format' });
     }
 
-    // Isolate this stream session in its own unique subfolder to avoid segment collisions
+    const jobId   = `job_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
     const streamId = `stream_${Date.now()}`;
     const streamDir = path.join(publicDir, streamId);
-    if (!fs.existsSync(streamDir)) {
-        fs.mkdirSync(streamDir);
-    }
+    if (!fs.existsSync(streamDir)) fs.mkdirSync(streamDir, { recursive: true });
 
-    const playlistName = 'playlist.m3u8';
-    const outputPath = path.join(streamDir, playlistName);
+    const outputPath = path.join(streamDir, 'playlist.m3u8');
 
-    // Optimized HLS Arguments Array
-    // -map 0:a? captures all existing audio tracks and multiplexes them inside the TS segments
+    // Register job as pending before spawning
+    jobs[jobId] = { status: 'pending', streamId, startedAt: Date.now() };
+
+    // Respond immediately with the job ID — frontend polls /api/convert/status/:jobId
+    res.json({ status: 'queued', jobId });
+
+    // Run FFmpeg in the background — no HTTP timeout risk
     const args = [
-        '-y', 
-        '-i', videoUrl, 
-        '-map', '0:v:0', 
-        '-map', '0:a?', 
-        '-c:v', 'copy', 
-        '-c:a', 'aac', 
+        '-y',
+        '-i', videoUrl,
+        '-map', '0:v:0',
+        '-map', '0:a?',
+        '-c:v', 'copy',
+        '-c:a', 'aac',
         '-f', 'hls',
-        '-hls_time', '6',                  // Target length for each TS segment (seconds)
-        '-hls_list_size', '0',             // 0 keeps all segments listed in the manifest (VOD mode)
-        '-hls_playlist_type', 'vod',       // Configures manifest type explicitly for VOD playback
-        '-hls_segment_filename', path.join(streamDir, 'seg_%03d.ts'), // Segment naming pattern
+        '-hls_time', '6',
+        '-hls_list_size', '0',
+        '-hls_playlist_type', 'vod',
+        '-hls_segment_filename', path.join(streamDir, 'seg_%03d.ts'),
         outputPath
     ];
 
-    console.log(`[FFmpeg] Initiating HLS stream allocation for: ${videoUrl}`);
+    console.log(`[FFmpeg] Job ${jobId} started for: ${videoUrl}`);
+    const proc = spawn('ffmpeg', args);
 
-    // Stream the process via spawn to securely handle large transcode tracking logs
-    const ffmpegProcess = spawn('ffmpeg', args);
-
-    ffmpegProcess.stderr.on('data', (data) => {
-        // Optional: Uncomment for live server log debugging of transcoding steps
-        // console.log(`[FFmpeg Progress]: ${data}`);
+    proc.stderr.on('data', d => {
+        const line = d.toString().trim();
+        if (line) console.log(`[FFmpeg ${jobId}] ${line}`);
     });
 
-    ffmpegProcess.on('close', (code) => {
-        if (code !== 0) {
-            console.error(`[FFmpeg] Process exited with failure code: ${code}`);
-            return res.status(500).send({ error: 'HLS Conversion pipeline failed' });
+    proc.on('close', code => {
+        if (code === 0) {
+            console.log(`[FFmpeg] Job ${jobId} completed ✅`);
+            jobs[jobId] = { status: 'done', manifestUrl: `/public/${streamId}/playlist.m3u8` };
+        } else {
+            console.error(`[FFmpeg] Job ${jobId} failed with code ${code}`);
+            jobs[jobId] = { status: 'error', error: `FFmpeg exited with code ${code}` };
         }
-        
-        console.log(`[FFmpeg] Successfully generated HLS manifest: ${streamId}/${playlistName}`);
-        // Return the clean, web-accessible path to your new HLS playlist index
-        res.send({ status: 'Success', manifestUrl: `/public/${streamId}/${playlistName}` });
     });
 
-    ffmpegProcess.on('error', (err) => {
-        console.error(`[FFmpeg] Binary execution failure:`, err);
-        res.status(500).send({ error: 'Failed to initialize system transcoder' });
+    proc.on('error', err => {
+        console.error(`[FFmpeg] Job ${jobId} spawn error:`, err);
+        jobs[jobId] = { status: 'error', error: err.message };
     });
+});
+
+// --- STEP 2: Frontend polls this until status is 'done' or 'error' ---
+app.get('/api/convert/status/:jobId', (req, res) => {
+    const job = jobs[req.params.jobId];
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    if (job.status === 'done') {
+        return res.json({ status: 'Success', manifestUrl: job.manifestUrl });
+    }
+    if (job.status === 'error') {
+        return res.json({ status: 'Error', error: job.error });
+    }
+    // Still running
+    res.json({ status: 'pending' });
+});
+
+// Health check — confirms FFmpeg is present
+app.get('/api/health', (req, res) => {
+    const { execSync } = require('child_process');
+    try {
+        const ver = execSync('ffmpeg -version 2>&1').toString().split('\n')[0];
+        res.json({ status: 'ok', ffmpeg: ver });
+    } catch (e) {
+        res.status(500).json({ status: 'error', ffmpeg: 'NOT FOUND' });
+    }
 });
 
 const server = http.createServer(app);
@@ -126,7 +153,7 @@ io.on('connection', (socket) => {
         if (existingUserIndex !== -1) {
             isARefresh = true;
             const oldUserInstance = room.users[existingUserIndex];
-            
+
             if (oldUserInstance.timeoutId) {
                 clearTimeout(oldUserInstance.timeoutId);
             }
@@ -150,7 +177,7 @@ io.on('connection', (socket) => {
             isPendingRemoval: false,
             timeoutId: null 
         };
-        
+
         room.users.push(userObj);
 
         if (assignHost) room.host = socket.id;
@@ -261,7 +288,7 @@ io.on('connection', (socket) => {
                     const currentRoom = rooms[roomId];
                     if (currentRoom) {
                         const freshInstance = currentRoom.users.find(u => u.userId === user.userId && !u.isPendingRemoval);
-                        
+
                         if (!freshInstance) {
                             currentRoom.users = currentRoom.users.filter(u => u.userId !== user.userId);
                             io.to(roomId).emit('chat_message', { system: true, text: `${user.username} left the party 👋` });
@@ -272,10 +299,10 @@ io.on('connection', (socket) => {
                                 currentRoom.users[0].isCoHost = false;
                                 io.to(roomId).emit('chat_message', { system: true, text: `👑 ${currentRoom.users[0].username} is the new Room Host` });
                             }
-                            
+
                             io.to(roomId).emit('update_users', currentRoom.users.filter(u => !u.isPendingRemoval));
                         }
-                        
+
                         if (currentRoom.users.length === 0) {
                             delete rooms[roomId];
                         }
