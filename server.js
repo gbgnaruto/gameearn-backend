@@ -215,6 +215,27 @@ app.post('/api/convert', (req, res) => {
     // We then craft a master playlist that links them all as EXT-X-MEDIA groups.
     // This is the most reliable approach for HLS.js audioTracks support.
 
+    // ── Build master playlist helper ──
+    // Called immediately after spawning (so frontend gets all tracks on first load)
+    // and again on primary proc close (to finalize).
+    const buildMasterPlaylist = () => {
+        try {
+            let master = '#EXTM3U\n#EXT-X-VERSION:3\n\n';
+            for (let i = 0; i < numAudio; i++) {
+                const label = audioLangs[i]?.label || `Track ${i+1}`;
+                const lang  = audioLangs[i]?.lang  || 'und';
+                const def   = i === 0 ? 'YES' : 'NO';
+                const uri   = i === 0 ? 'stream_0.m3u8' : `stream_${i}.m3u8`;
+                master += `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${label}",LANGUAGE="${lang}",DEFAULT=${def},AUTOSELECT=${def},URI="${uri}"\n`;
+            }
+            master += `\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="audio"\nstream_0.m3u8\n`;
+            fs.writeFileSync(path.join(streamDir, 'playlist.m3u8'), master);
+            console.log(`[Master] Job ${jobId}: master playlist written with ${numAudio} audio tracks`);
+        } catch(e) {
+            console.error('[Master] Failed to write master playlist:', e.message);
+        }
+    };
+
     if (numAudio <= 1) {
         // ── Single audio: simple single-output HLS ──
         const args = [
@@ -231,8 +252,70 @@ app.post('/api/convert', (req, res) => {
             '-hls_segment_filename', path.join(streamDir, 'seg_%03d.ts'),
             outputPath
         ];
+
+        console.log(`[FFmpeg] Live job ${jobId} started for: ${videoUrl}`);
+        const proc = spawn('ffmpeg', args);
+
+        const segWatcher = fs.watch(streamDir, (event, filename) => {
+            if (filename && filename.endsWith('.ts')) {
+                const segs = fs.readdirSync(streamDir).filter(f => f.endsWith('.ts')).length;
+                jobs[jobId].segments = segs;
+                if (jobs[jobId].status === 'pending' && segs >= LIVE_START_SEGMENTS) {
+                    console.log(`[FFmpeg] Job ${jobId} live — ${segs} segments ready, signalling frontend`);
+                    jobs[jobId].status = 'live';
+                }
+            }
+        });
+
+        let ffmpegBuffer = '';
+        proc.stderr.on('data', d => {
+            ffmpegBuffer += d.toString();
+            const lines = ffmpegBuffer.split('\r');
+            ffmpegBuffer = lines.pop();
+            for (const line of lines) {
+                if (!line.includes('time=')) continue;
+                const m = line.match(/time=([\d:]+\.?\d*)/);
+                if (m) {
+                    const parts = m[1].split(':').map(Number);
+                    const secs = parts.length === 3
+                        ? parts[0]*3600 + parts[1]*60 + parts[2]
+                        : parts[0]*60 + parts[1];
+                    jobs[jobId].progress = {
+                        currentTime: secs,
+                        duration: jobs[jobId].duration || 0,
+                        pct: jobs[jobId].duration > 0
+                            ? Math.min(99, Math.round((secs / jobs[jobId].duration) * 100))
+                            : null
+                    };
+                }
+            }
+        });
+
+        proc.on('close', code => {
+            segWatcher.close();
+            if (code === 0) {
+                console.log(`[FFmpeg] Job ${jobId} fully done ✅`);
+                jobs[jobId].status = 'done';
+            } else {
+                console.error(`[FFmpeg] Job ${jobId} failed with code ${code}`);
+                if (jobs[jobId]?.status === 'pending') {
+                    jobs[jobId].status = 'error';
+                    jobs[jobId].error  = `FFmpeg exited with code ${code}`;
+                }
+            }
+        });
+
+        proc.on('error', err => {
+            segWatcher.close();
+            console.error(`[FFmpeg] Job ${jobId} spawn error:`, err);
+            if (jobs[jobId].status === 'pending') {
+                jobs[jobId].status = 'error';
+                jobs[jobId].error  = err.message;
+            }
+        });
+
+        return; // done for single-audio case
     }
-    // fall through to spawn below
 
     // ── Multi-audio: one FFmpeg pass per audio track + video ──
     // Pass 0: video + audio track 0 (default)
@@ -244,7 +327,7 @@ app.post('/api/convert', (req, res) => {
         '-i', videoUrl
     ];
 
-    // Primary pass: video + track 0
+    // Pass 0: video + audio track 0 (default)
     const args = [
         '-y',
         ...commonInput,
@@ -276,32 +359,9 @@ app.post('/api/convert', (req, res) => {
         aProc.on('error', e => console.error(`[FFmpeg] Audio track ${i} error:`, e.message));
     }
 
-    // After primary pass finishes, build the master playlist
-    // This is called from the proc.on('close') handler below
-    jobs[jobId]._buildMaster = () => {
-        try {
-            const label0 = audioLangs[0]?.label || 'Track 1';
-            const lang0  = audioLangs[0]?.lang  || 'und';
-
-            let master = '#EXTM3U\n#EXT-X-VERSION:3\n\n';
-
-            // Add EXT-X-MEDIA entries for each audio track
-            for (let i = 0; i < numAudio; i++) {
-                const label = audioLangs[i]?.label || `Track ${i+1}`;
-                const lang  = audioLangs[i]?.lang  || 'und';
-                const def   = i === 0 ? 'YES' : 'NO';
-                const uri   = i === 0 ? 'stream_0.m3u8' : `stream_${i}.m3u8`;
-                master += `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${label}",LANGUAGE="${lang}",DEFAULT=${def},AUTOSELECT=${def},URI="${uri}"\n`;
-            }
-
-            // Video stream pointing to stream_0 (which has video+default audio)
-            master += `\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="audio"\nstream_0.m3u8\n`;
-            fs.writeFileSync(path.join(streamDir, 'playlist.m3u8'), master);
-            console.log(`[Master] Job ${jobId}: master playlist written with ${numAudio} audio tracks`);
-        } catch(e) {
-            console.error('[Master] Failed to write master playlist:', e.message);
-        }
-    };
+    // Write master playlist RIGHT NOW so frontend gets all tracks from first load
+    // (previously this was only written on proc close = after full conversion)
+    buildMasterPlaylist();
 
     console.log(`[FFmpeg] Live job ${jobId} started for: ${videoUrl}`);
     const proc = spawn('ffmpeg', args);
@@ -350,11 +410,8 @@ app.post('/api/convert', (req, res) => {
     proc.on('close', code => {
         segWatcher.close();
         if (code === 0) {
-            // Build master playlist for multi-audio before marking done
-            if (jobs[jobId]?._buildMaster) {
-                jobs[jobId]._buildMaster();
-                delete jobs[jobId]._buildMaster;
-            }
+            // Re-write master playlist on finish (finalizes any edge cases)
+            if (numAudio > 1) buildMasterPlaylist();
             console.log(`[FFmpeg] Job ${jobId} fully done ✅`);
             jobs[jobId].status = 'done';
         } else {
