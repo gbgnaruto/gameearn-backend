@@ -591,6 +591,122 @@ io.on('connection', (socket) => {
         }
     });
 
+    // ── Speed Sync ── host changes speed → all viewers change too
+    socket.on('set_speed', (data) => {
+        const room = rooms[data.roomId];
+        const user = room?.users.find(u => u.socketId === socket.id);
+        if (room && user && (user.isHost || user.isCoHost)) {
+            room.currentSpeed = data.speed;
+            socket.to(data.roomId).emit('sync_speed', { speed: data.speed });
+        }
+    });
+
+    // ── Private DM ── routed only to target socket
+    socket.on('private_dm', (data) => {
+        // data: { roomId, targetSocketId, text, fromName, fromPhoto }
+        const room = rooms[data.roomId];
+        const sender = room?.users.find(u => u.socketId === socket.id);
+        if (!room || !sender) return;
+        const target = room.users.find(u => u.socketId === data.targetSocketId);
+        if (!target) return;
+        io.to(data.targetSocketId).emit('private_dm', {
+            fromSocketId: socket.id,
+            fromName: sender.username,
+            fromPhoto: sender.photo,
+            text: data.text,
+            ts: Date.now()
+        });
+    });
+
+    // ── Shared Watchlist ── suggest queue visible to all, host approves
+    socket.on('wl_suggest', (data) => {
+        const room = rooms[data.roomId];
+        if (!room) return;
+        if (!room.watchlist) room.watchlist = [];
+        const item = { id: Date.now(), url: data.url, title: data.title, thumb: data.thumb, suggestedBy: data.username };
+        room.watchlist.push(item);
+        io.to(data.roomId).emit('wl_update', room.watchlist);
+    });
+
+    socket.on('wl_approve', (data) => {
+        const room = rooms[data.roomId];
+        const user = room?.users.find(u => u.socketId === socket.id);
+        if (!room || !(user?.isHost || user?.isCoHost)) return;
+        const item = room.watchlist?.find(w => w.id === data.id);
+        if (!item) return;
+        room.watchlist = room.watchlist.filter(w => w.id !== data.id);
+        io.to(data.roomId).emit('wl_update', room.watchlist);
+        // Promote to actual playlist via normal change_video flow
+        io.to(data.roomId).emit('wl_approved', item);
+    });
+
+    socket.on('wl_reject', (data) => {
+        const room = rooms[data.roomId];
+        const user = room?.users.find(u => u.socketId === socket.id);
+        if (!room || !(user?.isHost || user?.isCoHost)) return;
+        room.watchlist = (room.watchlist || []).filter(w => w.id !== data.id);
+        io.to(data.roomId).emit('wl_update', room.watchlist);
+    });
+
+    socket.on('get_watchlist', (data) => {
+        const room = rooms[data.roomId];
+        if (room) socket.emit('wl_update', room.watchlist || []);
+    });
+
+    // ── Smart Resume ── server stores per-user per-video resume point
+    socket.on('save_resume', (data) => {
+        // data: { roomId, url, time, userId }
+        const room = rooms[data.roomId];
+        if (!room) return;
+        if (!room.resumePoints) room.resumePoints = {};
+        room.resumePoints[`${data.userId}_${data.url}`] = { time: data.time, ts: Date.now() };
+    });
+
+    socket.on('get_resume', (data) => {
+        // data: { roomId, url, userId }
+        const room = rooms[data.roomId];
+        if (!room) return;
+        const key = `${data.userId}_${data.url}`;
+        const point = room.resumePoints?.[key];
+        socket.emit('resume_point', { url: data.url, time: point?.time || 0 });
+    });
+
+    // ── Friend System (Firestore-backed, server just routes invites) ──
+    socket.on('friend_invite', (data) => {
+        // data: { targetUserId, fromName, fromPhoto, roomId }
+        // Find target user across all rooms
+        for (const rid in rooms) {
+            const target = rooms[rid].users.find(u => u.userId === data.targetUserId && !u.isPendingRemoval);
+            if (target) {
+                io.to(target.socketId).emit('friend_invite', {
+                    fromUserId: socket._userId || data.fromUserId,
+                    fromName: data.fromName,
+                    fromPhoto: data.fromPhoto,
+                    roomId: data.roomId
+                });
+                break;
+            }
+        }
+    });
+
+    socket.on('watch_invite', (data) => {
+        // data: { targetUserId, fromName, roomId, roomName }
+        for (const rid in rooms) {
+            const target = rooms[rid].users.find(u => u.userId === data.targetUserId && !u.isPendingRemoval);
+            if (target) {
+                io.to(target.socketId).emit('watch_invite', {
+                    fromName: data.fromName,
+                    roomId: data.roomId,
+                    roomName: data.roomName
+                });
+                break;
+            }
+        }
+    });
+
+    // Store userId on socket for friend invite routing
+    socket.on('register_uid', (uid) => { socket._userId = uid; });
+
     socket.on('update_playlist', (data) => {
         const room = rooms[data.roomId];
         const user = room?.users.find(u => u.socketId === socket.id);
@@ -657,6 +773,9 @@ io.on('connection', (socket) => {
                                 currentRoom.users[0].isHost = true;
                                 currentRoom.users[0].isCoHost = false;
                                 io.to(roomId).emit('chat_message', { system: true, text: `👑 ${currentRoom.users[0].username} is the new Room Host` });
+                                // Notify the new host directly so their UI updates
+                                io.to(currentRoom.host).emit('you_are_host');
+                                io.to(currentRoom.host).emit('host_transferred', { reason: 'disconnect' });
                             }
 
                             io.to(roomId).emit('update_users', currentRoom.users.filter(u => !u.isPendingRemoval));
